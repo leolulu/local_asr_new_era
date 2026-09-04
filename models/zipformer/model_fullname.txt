@@ -1,0 +1,1 @@
+sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03
