@@ -92,6 +92,48 @@ def compatible_audio_path(audio: Path) -> Iterator[Path]:
         yield staged_audio
 
 
+def _copy_wave_with_trailing_silence(source: Path, destination: Path) -> None:
+    """Copy a PCM WAV and append one silent audio frame."""
+    with wave.open(str(source), "rb") as source_wav:
+        channels = source_wav.getnchannels()
+        sample_width = source_wav.getsampwidth()
+        frame_rate = source_wav.getframerate()
+        compression_type = source_wav.getcomptype()
+        compression_name = source_wav.getcompname()
+
+        with wave.open(str(destination), "wb") as destination_wav:
+            destination_wav.setnchannels(channels)
+            destination_wav.setsampwidth(sample_width)
+            destination_wav.setframerate(frame_rate)
+            destination_wav.setcomptype(compression_type, compression_name)
+
+            while frames := source_wav.readframes(1024 * 1024):
+                destination_wav.writeframesraw(frames)
+            destination_wav.writeframes(bytes(channels * sample_width))
+
+
+@contextmanager
+def vad_compatible_audio_path(audio: Path, window_size: int) -> Iterator[Path]:
+    """Provide a safe input path for the combined VAD and offline ASR executable.
+
+    The bundled executable can leave its final active speech segment unflushed
+    when the WAV frame count is exactly divisible by the VAD window size. Stage
+    such inputs with one silent audio frame so the final window is incomplete.
+    """
+    with wave.open(str(audio), "rb") as audio_wav:
+        requires_trailing_frame = audio_wav.getnframes() % window_size == 0
+
+    if not requires_trailing_frame:
+        with compatible_audio_path(audio) as compatible_audio:
+            yield compatible_audio
+        return
+
+    with tempfile.TemporaryDirectory(prefix="sherpa-onnx-vad-audio-") as temp_dir:
+        staged_audio = Path(temp_dir) / "input.wav"
+        _copy_wave_with_trailing_silence(audio, staged_audio)
+        yield staged_audio
+
+
 def validate_num_threads(num_threads: int, vad_num_threads: int | None = None) -> None:
     if num_threads <= 0:
         raise ValueError("num_threads must be greater than 0")
@@ -217,7 +259,7 @@ def run_vad_asr(
     with wave.open(str(audio), "rb") as wav_file:
         total_duration = wav_file.getnframes() / wav_file.getframerate()
 
-    with compatible_audio_path(audio) as compatible_audio:
+    with vad_compatible_audio_path(audio, vad_window_size) as compatible_audio:
         command = [
             executable,
             f"--silero-vad-model={vad_model}",
