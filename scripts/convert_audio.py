@@ -8,6 +8,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from .process_group import ProcessGroup
+except ImportError:
+    from process_group import ProcessGroup
+
 
 def convert_audio_to_wav(
     input_path: str | Path,
@@ -16,6 +21,7 @@ def convert_audio_to_wav(
     sample_rate: int = 16_000,
     ffmpeg_executable: str | Path = "ffmpeg",
     overwrite: bool = False,
+    process_group: ProcessGroup | None = None,
 ) -> Path:
     """Convert a single audio file to mono, 16-bit PCM WAV.
 
@@ -80,7 +86,10 @@ def convert_audio_to_wav(
         str(destination),
     ]
 
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if process_group is None:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    else:
+        result = process_group.run(command, text=True)
     if result.returncode != 0:
         details = result.stderr.strip() or result.stdout.strip() or "Unknown FFmpeg error"
         raise RuntimeError(f"FFmpeg conversion failed: {details}")

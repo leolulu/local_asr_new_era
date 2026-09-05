@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
+    from .process_group import ProcessGroup
+except ImportError:
+    from process_group import ProcessGroup
+
+try:
     from .asr_common import (
         DEFAULT_NUM_THREADS,
         DEFAULT_VAD_EXECUTABLE_PATH,
@@ -74,6 +79,7 @@ def run_sensevoice(
     vad_provider: str = "cpu",
     progress_callback: Callable[[float, float, int], None] | None = None,
     collect_observability: bool = False,
+    process_group: ProcessGroup | None = None,
 ) -> dict[str, Any]:
     """Recognize a WAV file with SenseVoice, using optimized VAD by default.
 
@@ -115,6 +121,7 @@ def run_sensevoice(
             failure_label="SenseVoice VAD recognition",
             progress_callback=progress_callback,
             collect_observability=collect_observability,
+            process_group=process_group,
         )
         if collect_observability:
             result["_observability"]["runtime"]["model_files"] = {
@@ -131,4 +138,5 @@ def run_sensevoice(
         debug=debug,
         provider=provider,
         failure_label="SenseVoice",
+        process_group=process_group,
     )

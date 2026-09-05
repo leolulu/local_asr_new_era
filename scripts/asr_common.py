@@ -18,8 +18,10 @@ from typing import Any, Callable, Iterator, Sequence
 
 try:
     from .process_metrics import ProcessResourceMonitor
+    from .process_group import ProcessGroup
 except ImportError:
     from process_metrics import ProcessResourceMonitor
+    from process_group import ProcessGroup
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -164,14 +166,17 @@ def validate_vad_options(
         raise ValueError("vad_window_size must be greater than 0")
 
 
-def _run_process(command: Sequence[str], failure_label: str) -> subprocess.CompletedProcess[str]:
-    process = subprocess.run(
+def _run_process(
+    command: Sequence[str],
+    failure_label: str,
+    process_group: ProcessGroup | None = None,
+) -> subprocess.CompletedProcess[str]:
+    group = process_group or ProcessGroup()
+    process = group.run(
         command,
-        capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
     )
     if process.returncode != 0:
         details = process.stderr.strip() or process.stdout.strip() or "Unknown error"
@@ -190,6 +195,7 @@ def run_json_asr(
     debug: bool,
     provider: str,
     failure_label: str,
+    process_group: ProcessGroup | None = None,
 ) -> dict[str, Any]:
     """Run a direct offline recognizer and parse its single JSON result."""
     audio = resolve_audio(audio_path)
@@ -206,7 +212,7 @@ def run_json_asr(
             "--print-args=false",
             str(compatible_audio),
         ]
-        process = _run_process(command, failure_label)
+        process = _run_process(command, failure_label, process_group)
 
     output = process.stdout.strip()
     if not output:
@@ -241,6 +247,7 @@ def run_vad_asr(
     failure_label: str,
     progress_callback: Callable[[float, float, int], None] | None = None,
     collect_observability: bool = False,
+    process_group: ProcessGroup | None = None,
 ) -> dict[str, Any]:
     """Run Silero VAD with an offline recognizer and parse timestamped segments."""
     audio = resolve_audio(audio_path)
@@ -280,7 +287,8 @@ def run_vad_asr(
             str(compatible_audio),
         ]
         process_started = time.perf_counter() if collect_observability else None
-        process = subprocess.Popen(
+        group = process_group or ProcessGroup()
+        with group.open(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -288,75 +296,77 @@ def run_vad_asr(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-        )
-        if process.stdout is None or process.stderr is None:
-            process.kill()
-            raise RuntimeError(f"{failure_label} could not capture process output")
+        ) as process:
+            if process.stdout is None or process.stderr is None:
+                process.kill()
+                raise RuntimeError(f"{failure_label} could not capture process output")
 
-        resource_monitor = (
-            ProcessResourceMonitor(process.pid) if collect_observability else None
-        )
-        if resource_monitor is not None:
-            resource_monitor.start()
-
-        stderr_lines: list[str] = []
-
-        def drain_stderr() -> None:
-            stderr_lines.extend(process.stderr)
-
-        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-        stderr_thread.start()
-        segments: list[dict[str, Any]] = []
-        unexpected_lines: list[str] = []
-        first_result_seconds: float | None = None
-        last_result_seconds: float | None = None
-        process_wall_seconds: float | None = None
-        resource_metrics: dict[str, Any] | None = None
-        try:
-            for line in process.stdout:
-                stripped_line = line.strip()
-                if not stripped_line:
-                    continue
-                match = SEGMENT_PATTERN.fullmatch(stripped_line)
-                if match is None:
-                    unexpected_lines.append(stripped_line)
-                    continue
-                segment = {
-                    "start": float(match.group("start")),
-                    "end": float(match.group("end")),
-                    "text": match.group("text"),
-                }
-                segments.append(segment)
-                if process_started is not None:
-                    result_seconds = time.perf_counter() - process_started
-                    if first_result_seconds is None:
-                        first_result_seconds = result_seconds
-                    last_result_seconds = result_seconds
-                if progress_callback is not None:
-                    progress_callback(
-                        min(segment["end"], total_duration),
-                        total_duration,
-                        len(segments),
-                    )
-            return_code = process.wait()
-        except BaseException:
-            process.kill()
-            process.wait()
-            raise
-        finally:
-            stderr_thread.join()
-            if process_started is not None:
-                process_wall_seconds = time.perf_counter() - process_started
+            resource_monitor = (
+                ProcessResourceMonitor(process.pid) if collect_observability else None
+            )
             if resource_monitor is not None:
-                try:
-                    resource_metrics = resource_monitor.stop(
-                        process_wall_seconds=process_wall_seconds or 0.0
-                    )
-                except Exception as error:
-                    resource_metrics = {
-                        "available": False,
-                        "reason": f"资源监控失败：{error}",
+                resource_monitor.start()
+
+            stderr_lines: list[str] = []
+
+            def drain_stderr() -> None:
+                stderr_lines.extend(process.stderr)
+
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            stderr_thread.start()
+            segments: list[dict[str, Any]] = []
+            unexpected_lines: list[str] = []
+            first_result_seconds: float | None = None
+            last_result_seconds: float | None = None
+            process_wall_seconds: float | None = None
+            resource_metrics: dict[str, Any] | None = None
+            try:
+                for line in process.stdout:
+                    stripped_line = line.strip()
+                    if not stripped_line:
+                        continue
+                    match = SEGMENT_PATTERN.fullmatch(stripped_line)
+                    if match is None:
+                        unexpected_lines.append(stripped_line)
+                        continue
+                    segment = {
+                        "start": float(match.group("start")),
+                        "end": float(match.group("end")),
+                        "text": match.group("text"),
                     }
+                    segments.append(segment)
+                    if process_started is not None:
+                        result_seconds = time.perf_counter() - process_started
+                        if first_result_seconds is None:
+                            first_result_seconds = result_seconds
+                        last_result_seconds = result_seconds
+                    if progress_callback is not None:
+                        progress_callback(
+                            min(segment["end"], total_duration),
+                            total_duration,
+                            len(segments),
+                        )
+                return_code = process.wait()
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            finally:
+                stderr_thread.join()
+                if process_started is not None:
+                    process_wall_seconds = time.perf_counter() - process_started
+                if resource_monitor is not None:
+                    try:
+                        resource_metrics = resource_monitor.stop(
+                            process_wall_seconds=process_wall_seconds or 0.0
+                        )
+                    except Exception as error:
+                        resource_metrics = {
+                            "available": False,
+                            "reason": f"资源监控失败：{error}",
+                        }
+
+        group.check_cancelled()
 
     if return_code != 0:
         details = "".join(stderr_lines).strip()

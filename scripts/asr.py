@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import wave
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,7 @@ try:
         vad_kwargs_from_args,
     )
     from .convert_audio import convert_audio_to_wav
+    from .process_group import ProcessGroup
     from .sensevoice_asr import run_sensevoice
     from .zipformer_asr import run_zipformer
 except ImportError:
@@ -52,6 +54,7 @@ except ImportError:
         vad_kwargs_from_args,
     )
     from convert_audio import convert_audio_to_wav
+    from process_group import ProcessGroup
     from sensevoice_asr import run_sensevoice
     from zipformer_asr import run_zipformer
 
@@ -147,9 +150,10 @@ class ChineseArgumentParser(argparse.ArgumentParser):
 class ConsoleProgress:
     """Render status and progress on stderr without contaminating ASR output."""
 
-    def __init__(self) -> None:
-        self._interactive = sys.stderr.isatty()
-        self._lock = threading.Lock()
+    def __init__(self, *, prefix: str = "", output_lock: Any = None) -> None:
+        self._prefix = prefix
+        self._interactive = sys.stderr.isatty() and not prefix
+        self._lock = output_lock if output_lock is not None else threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._active = False
@@ -175,9 +179,9 @@ class ConsoleProgress:
             self._label = message
             if self._interactive:
                 self._clear_line_locked()
-                print(f"[状态] {message}", file=sys.stderr, flush=True)
+                print(f"{self._prefix}[状态] {message}", file=sys.stderr, flush=True)
             else:
-                print(f"[状态] {message}", file=sys.stderr, flush=True)
+                print(f"{self._prefix}[状态] {message}", file=sys.stderr, flush=True)
 
     def update(self, processed_seconds: float, total_seconds: float, segments: int) -> None:
         with self._lock:
@@ -192,7 +196,7 @@ class ConsoleProgress:
                 return
             self._last_reported_bucket = bucket
             print(
-                f"[进度] {percent:5.1f}% | 已处理 {processed_seconds:.1f}/"
+                f"{self._prefix}[进度] {percent:5.1f}% | 已处理 {processed_seconds:.1f}/"
                 f"{total_seconds:.1f} 秒 | {segments} 个分段",
                 file=sys.stderr,
                 flush=True,
@@ -212,7 +216,7 @@ class ConsoleProgress:
                 print(file=sys.stderr, flush=True)
             elapsed = time.perf_counter() - self._started_at
             print(
-                f"[完成] 识别完成，共 {self._segment_count} 个分段，耗时 {elapsed:.1f} 秒",
+                f"{self._prefix}[完成] 识别完成，共 {self._segment_count} 个分段，耗时 {elapsed:.1f} 秒",
                 file=sys.stderr,
                 flush=True,
             )
@@ -313,6 +317,7 @@ def _prepared_wav(
     ffmpeg_executable: str | Path,
     status_callback: StatusCallback | None = None,
     collect_observability: bool = False,
+    process_group: ProcessGroup | None = None,
 ) -> Iterator[PreparedAudio]:
     preparation_started = time.perf_counter() if collect_observability else None
     if status_callback is not None:
@@ -360,6 +365,7 @@ def _prepared_wav(
             wav_path,
             sample_rate=16_000,
             ffmpeg_executable=ffmpeg_executable,
+            process_group=process_group,
         )
         conversion_elapsed = (
             time.perf_counter() - conversion_started
@@ -410,6 +416,7 @@ def run_asr(
     status_callback: StatusCallback | None = None,
     progress_callback: ProgressCallback | None = None,
     collect_observability: bool = False,
+    process_group: ProcessGroup | None = None,
 ) -> dict[str, Any]:
     """Convert one media file as needed, then recognize it with the chosen model."""
     task_started = time.perf_counter() if collect_observability else None
@@ -435,6 +442,7 @@ def run_asr(
         ffmpeg_executable=ffmpeg_executable,
         status_callback=status_callback,
         collect_observability=collect_observability,
+        process_group=process_group,
     ) as prepared_audio:
         if status_callback is not None:
             status_callback(f"正在加载 {normalized_model} 并执行 VAD 分段识别")
@@ -449,6 +457,7 @@ def run_asr(
                 use_vad=True,
                 progress_callback=progress_callback,
                 collect_observability=collect_observability,
+                process_group=process_group,
                 **vad_options,
             )
         else:
@@ -460,6 +469,7 @@ def run_asr(
                 provider=provider,
                 progress_callback=progress_callback,
                 collect_observability=collect_observability,
+                process_group=process_group,
                 **vad_options,
             )
 
@@ -879,6 +889,43 @@ def _collect_input_files(input_path: str | Path) -> tuple[list[Path], bool]:
     return media_files, True
 
 
+def _validate_output_conflicts(
+    input_files: list[Path],
+    models_to_run: tuple[str, ...],
+    *,
+    write_txt: bool,
+    write_srt: bool,
+    write_json: bool,
+) -> None:
+    owners: dict[Path, list[Path]] = {}
+    for source_path in input_files:
+        for model in models_to_run:
+            for output_path in _selected_output_paths(
+                source_path,
+                write_txt=write_txt,
+                write_srt=write_srt,
+                write_json=write_json,
+                model_name=model if len(models_to_run) > 1 else None,
+            ):
+                owners.setdefault(output_path, []).append(source_path)
+    conflicts = [
+        f"  {output_path} <- {', '.join(str(source) for source in sources)}"
+        for output_path, sources in owners.items()
+        if len(sources) > 1
+    ]
+    if conflicts:
+        raise ValueError(
+            "多个输入文件的输出路径冲突，请先调整输入文件名：\n" + "\n".join(conflicts)
+        )
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("数量必须大于 0")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = ChineseArgumentParser(
         add_help=False,
@@ -897,7 +944,8 @@ def parse_args() -> argparse.Namespace:
             "  uv run scripts/asr.py \"video.mp4\" --model sensevoice --all-output\n"
             "  uv run scripts/asr.py \"video.mp4\" --model all --all-output\n"
             "  uv run scripts/asr.py \"D:\\Media\" --model zipformer --all-output\n"
-            "  uv run scripts/asr.py \"D:\\Media\" --model all --all-output --overwrite\n\n"
+            "  uv run scripts/asr.py \"D:\\Media\" --model all --all-output --overwrite\n"
+            "  uv run scripts/asr.py \"D:\\Media\" --model all --srt --file-workers 2\n\n"
             "输出说明：\n"
             "  未指定任何输出参数时，完整 JSON 结果打印到控制台。\n"
             "  文件夹模式或 --model all 模式下，控制台 JSON 是包含文件路径及识别结果的数组。\n"
@@ -906,6 +954,8 @@ def parse_args() -> argparse.Namespace:
             "  --model all 会依次运行 sensevoice、zipformer，并生成例如 "
             "video.sensevoice.txt 和 video.zipformer.txt。\n"
             "  --all-output 等同于同时指定 --txt --srt --json。\n"
+            "  批处理写文件前会检查输出路径冲突；同名不同扩展名的输入可能冲突，"
+            "--overwrite 也不会放行。\n"
             "  默认遇到本次要生成的任一同名结果文件就跳过整个源文件；"
             "--overwrite 可以覆盖。\n"
             "  JSON 还包含输入、参数、分阶段耗时、联合 VAD+ASR 子进程资源和结果统计。\n"
@@ -940,6 +990,16 @@ def parse_args() -> argparse.Namespace:
             "选择语音识别模型：sensevoice 支持普通话、粤语、英语、日语、韩语；"
             "zipformer 支持中文、英语；all 会按照 sensevoice、zipformer 的顺序"
             "依次运行全部模型。默认使用 sensevoice。"
+        ),
+    )
+    basic_group.add_argument(
+        "--file-workers",
+        type=_positive_int,
+        default=1,
+        metavar="数量",
+        help=(
+            "同时处理的文件数上限，默认 1，逐个处理文件。大于 1 时按文件并发，"
+            "同一文件的模型仍依次运行；不调整 ASR 和 VAD 的推理线程数。"
         ),
     )
     basic_group.add_argument(
@@ -1046,6 +1106,27 @@ def main() -> int:
     invocation_id = str(uuid4()) if collect_observability else None
     models_to_run = MODEL_ORDER if args.model == ALL_MODELS_CHOICE else (args.model,)
     multi_model_mode = len(models_to_run) > 1
+    try:
+        _validate_output_conflicts(
+            input_files,
+            models_to_run,
+            write_txt=write_txt,
+            write_srt=write_srt,
+            write_json=write_json,
+        )
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    file_workers = min(args.file_workers, len(input_files))
+    concurrent_mode = file_workers > 1
+    process_group = ProcessGroup()
+    output_lock = threading.Lock()
+
+    def report(message: str) -> None:
+        with output_lock:
+            print(message, file=sys.stderr, flush=True)
+
     if directory_mode:
         print(
             f"[批处理] 当前目录共发现 {len(input_files)} 个支持的音视频文件，"
@@ -1054,26 +1135,27 @@ def main() -> int:
             flush=True,
         )
 
-    console_results: list[dict[str, Any]] = []
-    succeeded = 0
-    skipped = 0
-    failed = 0
     total_files = len(input_files)
-    for index, source_path in enumerate(input_files, start=1):
+    if concurrent_mode:
+        report(f"[并发] 最多同时处理 {file_workers} 个文件，同一文件的模型依次运行")
+
+    def process_file(
+        index: int,
+        source_path: Path,
+    ) -> tuple[list[dict[str, Any]], int, int, int]:
+        console_results: list[dict[str, Any]] = []
+        succeeded = 0
+        skipped = 0
+        failed = 0
+        process_group.check_cancelled()
         if directory_mode:
-            print(
-                f"[文件 {index}/{total_files}] {source_path.name}",
-                file=sys.stderr,
-                flush=True,
-            )
+            report(f"[文件 {index}/{total_files}] {source_path.name}")
 
         for model_index, current_model in enumerate(models_to_run, start=1):
+            process_group.check_cancelled()
+            prefix = f"[{source_path.name}][{current_model}] " if concurrent_mode else ""
             if multi_model_mode:
-                print(
-                    f"[模型 {model_index}/{len(models_to_run)}] {current_model}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                report(f"{prefix}[模型 {model_index}/{len(models_to_run)}] {current_model}")
 
             output_model_name = current_model if multi_model_mode else None
             requested_paths = _selected_output_paths(
@@ -1086,15 +1168,11 @@ def main() -> int:
             existing_paths = [path for path in requested_paths if path.exists()]
             if existing_paths and not args.overwrite:
                 existing = ", ".join(path.name for path in existing_paths)
-                print(
-                    f"[跳过][{current_model}] 已存在本次要生成的结果文件：{existing}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                report(f"{prefix}[跳过][{current_model}] 已存在本次要生成的结果文件：{existing}")
                 skipped += 1
                 continue
 
-            progress = ConsoleProgress()
+            progress = ConsoleProgress(prefix=prefix, output_lock=output_lock)
             progress.start()
             try:
                 result = run_asr(
@@ -1110,8 +1188,10 @@ def main() -> int:
                     status_callback=progress.status,
                     progress_callback=progress.update,
                     collect_observability=collect_observability,
+                    process_group=process_group,
                     **vad_kwargs_from_args(args),
                 )
+                process_group.check_cancelled()
                 if collect_observability:
                     result["metadata"]["invocation"] = {
                         "run_id": invocation_id,
@@ -1121,6 +1201,8 @@ def main() -> int:
                         "model_count": len(models_to_run),
                         "file_index": index,
                         "file_count": total_files,
+                        "file_workers_requested": args.file_workers,
+                        "file_workers_effective": file_workers,
                         "command_started_at": invocation_started_at.isoformat(
                             timespec="milliseconds"
                         ),
@@ -1156,12 +1238,50 @@ def main() -> int:
                 succeeded += 1
             except (OSError, ValueError, RuntimeError) as error:
                 progress.abort()
-                print(
-                    f"[失败][{current_model}] {source_path}: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                process_group.check_cancelled()
+                report(f"[失败][{current_model}] {source_path}: {error}")
                 failed += 1
+            finally:
+                progress.abort()
+        return console_results, succeeded, skipped, failed
+
+    file_results: dict[int, tuple[list[dict[str, Any]], int, int, int]] = {}
+    executor: ThreadPoolExecutor | None = None
+    try:
+        if concurrent_mode:
+            executor = ThreadPoolExecutor(max_workers=file_workers)
+            futures = {
+                executor.submit(process_file, index, source_path): index
+                for index, source_path in enumerate(input_files, start=1)
+            }
+            pending = set(futures)
+            while pending:
+                # Periodically return to Python so Ctrl+C stays responsive on Windows.
+                done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    file_results[futures[future]] = future.result()
+        else:
+            for index, source_path in enumerate(input_files, start=1):
+                file_results[index] = process_file(index, source_path)
+    except KeyboardInterrupt:
+        process_group.cancel()
+        report("[中断] 已停止批处理，正在清理子进程和临时文件")
+        return 130
+    except BaseException:
+        process_group.cancel()
+        raise
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    console_results: list[dict[str, Any]] = []
+    succeeded = skipped = failed = 0
+    for index in sorted(file_results):
+        results, file_succeeded, file_skipped, file_failed = file_results[index]
+        console_results.extend(results)
+        succeeded += file_succeeded
+        skipped += file_skipped
+        failed += file_failed
 
     aggregate_console_output = directory_mode or multi_model_mode
     if not selected_output and (aggregate_console_output or console_results):
