@@ -188,6 +188,9 @@ class ConsoleProgress:
             self._processed_seconds = processed_seconds
             self._total_seconds = total_seconds
             self._segment_count = segments
+            if processed_seconds == 0 and total_seconds == 0 and segments == 0:
+                self._last_reported_bucket = -1
+                return
             if self._interactive:
                 return
             percent = 100 * processed_seconds / total_seconds if total_seconds else 0
@@ -465,6 +468,7 @@ def run_asr(
                 prepared_audio.wav_path,
                 num_threads=num_threads,
                 decoding_method=decoding_method,
+                status_callback=status_callback,
                 debug=debug,
                 provider=provider,
                 progress_callback=progress_callback,
@@ -499,6 +503,23 @@ def run_asr(
             task_finished_at=task_finished_at,
             total_wall_seconds=total_wall_seconds,
         )
+        retry = internal_observability.get("retry")
+        if retry is not None:
+            metadata["retry"] = retry
+            effective_vad = dict(metadata["configuration"]["vad"])
+            effective_vad["min_silence_duration"] = retry["attempts"][-1][
+                "vad_min_silence_duration"
+            ]
+            effective_vad["max_speech_duration"] = retry["attempts"][-1][
+                "vad_max_speech_duration"
+            ]
+            metadata["configuration"]["vad_effective"] = effective_vad
+            failed_wall = retry["failed_attempts_wall_seconds"]
+            metadata["timing"]["failed_attempts_wall_seconds"] = failed_wall
+            metadata["timing"]["other_overhead_wall_seconds"] = round(
+                max(0.0, metadata["timing"]["other_overhead_wall_seconds"] - failed_wall),
+                6,
+            )
         metadata_finished = time.perf_counter()
         metadata["timing"]["metadata_generation_wall_seconds"] = round(
             metadata_finished - metadata_started, 6
@@ -960,6 +981,8 @@ def parse_args() -> argparse.Namespace:
             "--overwrite 可以覆盖。\n"
             "  JSON 还包含输入、参数、分阶段耗时、联合 VAD+ASR 子进程资源和结果统计。\n"
             "  完整观测只在输出 JSON 或控制台 JSON 时启用；仅输出 TXT/SRT 时不采集。\n"
+            "  ZipFormer 仅在确认长片段错误后逐级收紧 VAD 重试，最多尝试 4 次；"
+            "首轮参数不变，全部失败后继续其他任务。\n"
             "  处理状态和进度写入标准错误流，不会进入 JSON、TXT 或 SRT 内容。"
         ),
     )
